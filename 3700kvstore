@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+import argparse, socket, time, json, select, struct, sys, math, os, random
+
+BROADCAST = "FFFF"
+TOLERANCE = 50
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        self.store = {}
+        self.log = []
+        self.unacked = {}
+
+        self.state = "follower"
+        self.term = 0
+        self.voted_for = None
+        self.my_votes = 0
+        self.leader = BROADCAST      
+
+        self.majority = math.ceil(len(self.others) / 2) + 1
+
+
+        # index of highest log entry applied to state machine
+        self.last_applied = 0
+        self.commit_index = 0
+        # for each server, index of the next log entry to send to that server
+        self.next_index = self.init_next()
+        # for each server, index of highest log entry known to be replicated
+        self.match_index = self.init_match()
+
+        self.request_queue = []
+
+
+        # election timeouts are chosen randomly from a fixed interval we will use 150–300ms
+        self.election_timeout = random.randint(500, 600) / 1000
+        self.last_heartbeat = time.time()
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    # Send message to destination
+    def send(self, message):
+      #print("Sending message: %s" % message, flush=True)
+      self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+
+
+    # ---------------------------- Helper Functions ---------------------------- #
+
+    '''
+
+    '''
+    def init_next(self):
+      next_index = {}
+      if self.state == 'leader':
+        for server in self.others:
+          next_index[server] = len(self.log)
+      return next_index
+
+    '''
+
+    '''
+    def init_match(self):
+      indices = {}
+      if self.state == 'leader':
+        for server_id in self.others:
+            indices[server_id] = 0
+      return indices
+
+    '''
+    All servers:
+
+    '''
+    def check_terms(self, given_term, leader):
+        if given_term > self.current_term:
+            self.become_follower(given_term, leader)
+
+
+
+    # ---------------------------- Election Functions ---------------------------- #
+
+    # Handles leader election
+    def start_election(self):
+        self.state = "candidate"
+        self.term += 1
+        self.voted_for = self.id
+        self.my_votes = 1
+
+        print("Starting election", flush=True)
+
+        election = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "election", "term": self.term }
+        self.send(election)
+
+    # Handle election request
+    def handle_election(self, message):
+      #print("Received election request message: %s" % message, flush=True)
+      if message["term"] > self.term:
+          self.term = message["term"]
+          self.state = "follower"
+          self.voted_for = None
+          self.my_votes = 0
+          self.leader = BROADCAST
+      if self.state == "follower" and self.voted_for is None:
+          self.last_heartbeat = time.time()
+          election = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "vote", "term": self.term }
+          self.send(election)
+          print("Sent election message: %s" % election, flush=True)
+      self.voted_for = message["src"]
+
+    # Handle vote message
+    def handle_vote(self, message):
+      #print("Received vote message: %s" % message, flush=True)
+      if message["term"] == self.term and self.leader == BROADCAST:
+        self.my_votes += 1
+
+        if self.my_votes > len(self.others) / 2 and self.state == "candidate":
+          self.state = "leader"
+          self.leader = self.id
+          print("I am the leader", flush=True)
+          self.next_index = self.init_next()
+
+          # Send out heartbeat
+          heartbeat = { "src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "heartbeat", "term": self.term }
+          self.send(heartbeat)
+
+          self.voted_for = None
+          self.my_votes = 0
+
+    # Handle heartbeat message
+    def handle_heartbeat(self, message):
+        print("Received heartbeat message: %s" % message, flush=True)
+        if message["term"] >= self.term:
+            self.term = message["term"]
+            self.state = "follower"
+            self.voted_for = None
+            self.my_votes = 0
+            self.last_heartbeat = time.time()
+            self.leader = message["leader"]
+
+        # if self.state == "follower":
+        #     self.leader = message["src"]
+
+        #self.last_heartbeat = time.time()
+
+
+
+
+    # ---------------------------- Database Functions ---------------------------- #
+
+    # If the client sends any message (get() or put()) to a replica that is not the leader, it should respond with a redirect:
+    """ def handle_put(self, message):
+        if message["src"] == self.leader:
+            #print("Putting key %s" % message["key"], flush=True)
+            self.store[message["key"]] = message["value"]
+            self.log[message["key"]] = message["value"]
+            message = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"] }
+            self.send(message)
+        elif self.leader == self.id:
+            #print("Putting key %s" % message["key"], flush=True)
+            self.store[message["key"]] = message["value"]
+            broadcast = { "src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "put", "key": message["key"], "value": message["value"], "MID": message["MID"] }
+           # print("Broadcasting put message: %s" % broadcast, flush=True)
+            self.send(broadcast)
+
+            message = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"] }
+            self.send(message)
+             #leader = message["leader"]
+        #if message["leader"] == BROADCAST:
+        else:
+            #print("Should be foward message to leader %s" % message["leader"], flush=True)
+            message = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "redirect", "MID": message["MID"] }
+            self.send(message)
+        ##print("Unhandled case", flush=True)
+            # self.store[message["key"]] = message["value"]
+            # message = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
+            # self.send(message)
+
+
+                     leader = message["leader"]
+        if leader != self.id:
+            #print("Should be foward message to leader %s" % leader, flush=True)
+            message = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "redirect", "MID": message["MID"]}
+            self.send(message)
+        else:
+            #print("Getting key %s" % message["key"], flush=True)
+            value = self.store[message["key"]]
+            message = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": value}
+            self.send(message) 
+
+    """
+
+    # ----------------------- follower/ candidate functions ---------------------- #
+
+    def redirect(self, message):
+        if self.leader == BROADCAST:
+            self.request_queue.append(message)
+        else:
+            for msg in list(self.request_queue):
+                response = {'src': self.id, "dst": msg['src'], 'leader': self.leader,
+                                                    'type': 'redirect', 'MID': msg['MID']}
+                self.send(response)
+                self.request_queue.remove(msg)
+            response_to_client = {'src': self.id, "dst": message['src'], 'leader': self.leader,
+                                  'type': 'redirect', 'MID': message['MID']}
+            self.send(response_to_client)
+
+
+
+
+    # Creates append response
+    def append_response(self, msg, prev_log_index, prev_log_term, accept_request):
+        response = {'src': self.id, "dst": msg['src'], 'leader': self.leader, 'term': self.term,
+                    'type': 'append_response', 'MID': msg['MID'], 'prev_log_index': prev_log_index,
+                    'prev_log_term': prev_log_term, 'entries': msg['entries'], 'receive_time': time.time(),
+                    'last_log_index': len(self.log) - 1, 'accept_request': accept_request}
+        self.send(response)
+
+
+    # Handles append request from leader
+    def handle_append_request(self, message):
+        if self.id != message["leader"]:
+          if message['leader_commit'] > self.commit_index:
+            self.commit_index = min(message['leader_commit'], len(self.log) - 1)
+            return
+        if self.term > message['term']:
+            # REJECTED
+            self.append_response(message, message['prev_log_index'], message['prev_log_term'], False)
+            return
+        # NEED TO CHECK MORE CASES BUT from here on out saying we will accept
+        keep_index = message['prev_log_index'] + 1
+        self.log = self.log[:keep_index]
+        for entry in message['entries']:  # TODO fix this
+            if entry not in self.log:
+                self.log.append(entry)
+        if self.last_applied > len(self.log) - 1:
+            self.last_applied = len(self.log) - 1
+        if self.commit_index > len(self.log) - 1:
+            self.commit_index = len(self.log) - 1
+        if message['leader_commit'] > self.commit_index:
+            self.commit_index = min(message['leader_commit'], len(self.log) - 1)
+        self.append_response(message, message['prev_log_index'], message['prev_log_term'], True)
+
+
+    # -------------------------- mainly leader functions ------------------------- #
+
+            
+    def handle_get(self, message):
+      if self.commit_index > self.last_applied:
+        self.last_applied += 1
+        # print("LENGTH: " + str(len(self.log)) + "LAST_APPLIED: " + str(self.last_applied) + "COMMIT: " + str(self.commit_index))
+        # print("LOG: " + str(self.log[self.last_applied]) + "LEN: " + str(len(self.log[self.last_applied])))
+        (mid, command, term) = self.log[self.last_applied]
+        command = json.loads(command)
+      if self.id == message["leader"]:
+        temp = []
+        key = message['key']
+        command = json.dumps({'cmd': message['type'], 'client_id': message['src'], 'key': key})
+
+        self.unacked[message['MID']] = set()
+
+        entry = (message['MID'], command, self.term)
+        self.log.append(entry)
+        temp.append(entry)
+
+        self.send_appendEntryRPCs(temp, message['MID'])
+
+        value = self.store.get(command['key'], '')
+        response = {'src': self.id, 'dst': command['client_id'], 'leader': self.id, 'type': 'ok','MID': mid, 'value': value}
+        self.send(response)
+      else:
+        self.redirect(message)
+
+
+    def handle_put(self, message):
+      if self.commit_index > self.last_applied:
+        self.last_applied += 1
+        (mid, command, term) = self.log[self.last_applied]
+        command = json.loads(command)
+        self.store[command['key']] = command['value']
+      if self.id == message["leader"]:
+        temp = []
+        response = {'src': self.id, 'dst': message['src'],
+                                                     'leader': self.id, 'type': 'ok',
+                                                     'MID': message['MID']}
+        self.send(response)
+        key = message['key']
+        value = message['value']
+        command = {'cmd': message['type'], 'client_id': message['src'], 'key': key, 'value': value}
+
+        entry = (message['MID'], command, self.term)
+        self.log.append(entry)
+
+        temp.append(entry)
+        self.unacked[message['MID']] = set()
+        self.send_appendEntryRPCs(temp, message['MID'])
+      else:
+        self.redirect(message)
+
+
+
+        
+    def handle_rpc(self, message):
+      if self.id == message["leader"]:
+        if message['accept_request']:
+            # set the next index to send to be: the index of last entry appended + 1
+            self.next_index[message['src']] = message['last_log_index'] + 1
+            try:
+                unacked_msgs = self.unacked[message['MID']]
+            except KeyError:
+                self.check_timeouts()
+                return
+            for m in list(unacked_msgs):
+                m_json = json.loads(m)
+                if m_json['dst'] == message['src']:
+                    self.unacked[message['MID']].remove(m)
+                    break
+            if len(self.unacked[message['MID']]) == len(self.others) - self.majority:
+                self.commit_index += 1
+                self.unacked.pop(message['MID'])
+        elif not message['accept_request']:
+            self.next_index[message['src']] = message['prev_log_index']
+            temp_entries = []
+            temp_entries.append(self.log[self.next_index[message['src']]])
+            # print("%s temp_entries %s" % (self.id, self.log[self.next_index[msg['src']]]))
+            for entry in message['entries']:
+                temp_entries.append(entry)  # TODO fix
+            try:
+                unacked_servers = self.unacked[message['MID']]
+            except KeyError:
+                self.check_timeouts()
+                return
+            for m in list(unacked_servers):
+                m_json = json.loads(m)
+                if m_json['dst'] == message['src']:
+                    self.unacked[message['MID']].remove(m)
+                    break
+            self.send_appendEntryRPC(temp_entries, message['src'], message['MID'])
+        self.check_timeouts()
+
+
+    """
+    Leader send appendEntryRPC to all followers
+    """
+    def send_appendEntryRPCs(self, entries, mid):
+      for rep in self.others:
+        self.send_appendEntryRPC(rep, entries, mid)
+
+    def send_appendEntryRPC(self, rep, entries, mid):
+        print(self.next_index)
+        prev_log_index = self.next_index[rep] - 1
+        (prev_mid, prev_command, prev_log_term) = self.log[prev_log_index]
+        send_time = time.time()
+        message = {'src': self.id, 'dst': rep, 'leader': self.id,
+                            'type': 'append_request', 'MID': mid, 'term': self.term,
+                            'entries': entries, 'leader_commit': self.commit_index, 'send_time': send_time,
+                            'prev_log_index': prev_log_index, 'prev_log_term': prev_log_term}
+        self.send(message)
+        # check that it's not a heartbeat
+        if len(entries) > 0:
+          self.unacked[mid].add(json.dumps(message))
+
+ 
+
+    """
+    Leader resend messages when did not receive an ack of a message after timeout
+    """
+    def check_timeouts(self):
+        for mid in self.unacked:
+            unacked_msgs = self.unacked[mid]
+            for msg in list(unacked_msgs):
+                msg2 = json.loads(unacked_msgs)
+                if time.time() - msg2['send_time'] >= TOLERANCE:
+                    cur_time = time.time()
+                    # update time and dict
+                    msg2['send_time'] = cur_time
+                    new_m = msg
+                    self.unacked[mid].remove(msg)
+                    self.unacked[mid].add(new_m)
+                    self.send(new_m)
+                    return
+
+   
+      
+
+
+
+
+    # ------------------------------ Main Functions ------------------------------ #
+
+    def handle_message(self, message):
+      if message["type"] == "get":
+        #print("Received get request for key %s" % message["key"])
+        self.handle_get(message)
+      elif message["type"] == "put":
+       # print("Received put request for key %s" % message["key"])
+        self.handle_put(message)
+      elif message["type"] == "election":
+        self.handle_election(message)
+      elif message["type"] == "vote":
+        self.handle_vote(message)
+      elif message["type"] == "heartbeat":
+        self.handle_heartbeat(message)
+      elif message["type"] == "append_request":
+        self.handle_append_request(message)
+      elif message["type"] == "append_response":
+        self.handle_rpc(message)
+
+    def run(self):
+      while True:
+        data, addr = self.socket.recvfrom(65535)
+        msg = data.decode('utf-8')
+
+        print("Received message '%s'" % (msg,), flush=True)
+        self.handle_message(json.loads(msg))
+
+        current = time.time()
+        if self.state == "follower" and current - self.last_heartbeat > self.election_timeout:
+            self.start_election()
+
+            self.last = current
+
+        if self.state == "leader" and current - self.last > self.election_timeout:
+            heartbeat = { "src": self.id, "dst": BROADCAST, "leader": self.id, "type": "heartbeat", "term": self.term }
+            self.send(heartbeat)
+            self.last = current
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
+
+
+
+
+""" #!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+
+BROADCAST = "FFFF"
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        self.store = {}
+        self.log = {}
+
+        self.state = "follower"
+        self.term = 0
+        self.voted_for = None
+        self.my_votes = 0
+        self.leader = BROADCAST      
+
+        # election timeouts are chosen randomly from a fixed interval we will use 150–300ms
+        self.election_timeout = random.randint(500, 600) / 1000
+        self.last_heartbeat = time.time()
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    # Send message to destination
+    def send(self, message):
+      #print("Sending message: %s" % message, flush=True)
+      self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+
+
+    # ---------------------------- Election Functions ---------------------------- #
+
+    # Handles leader election
+    def start_election(self):
+        self.state = "candidate"
+        self.term += 1
+        self.voted_for = self.id
+        self.my_votes = 1
+
+        print("Starting election", flush=True)
+
+        election = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "election", "term": self.term }
+        self.send(election)
+
+    # Handle election request
+    def handle_election(self, message):
+      #print("Received election request message: %s" % message, flush=True)
+      if message["term"] > self.term:
+          self.term = message["term"]
+          self.state = "follower"
+          self.voted_for = None
+          self.my_votes = 0
+          self.leader = BROADCAST
+      if self.state == "follower" and self.voted_for is None:
+          self.last_heartbeat = time.time()
+          election = { "src": self.id, "dst": message["src"], "leader": self.leader, "type": "vote", "term": self.term }
+          self.send(election)
+          print("Sent election message: %s" % election, flush=True)
+      self.voted_for = message["src"]
+
+    # Handle vote message
+    def handle_vote(self, message):
+      #print("Received vote message: %s" % message, flush=True)
+      if message["term"] == self.term and self.leader == BROADCAST:
+        self.my_votes += 1
+
+        if self.my_votes > len(self.others) / 2 and self.state == "candidate":
+          self.state = "leader"
+          self.leader = self.id
+          print("I am the leader", flush=True)
+
+          # Send out heartbeat
+          heartbeat = { "src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "heartbeat", "term": self.term }
+          self.send(heartbeat)
+
+          self.voted_for = None
+          self.my_votes = 0
+
+    # Handle heartbeat message
+    def handle_heartbeat(self, message):
+        print("Received heartbeat message: %s" % message, flush=True)
+        if message["term"] >= self.term:
+            self.term = message["term"]
+            self.state = "follower"
+            self.voted_for = None
+            self.my_votes = 0
+            self.last_heartbeat = time.time()
+            self.leader = message["leader"]
+
+        # if self.state == "follower":
+        #     self.leader = message["src"]
+
+        #self.last_heartbeat = time.time()
+
+
+
+
+    # ---------------------------- Database Functions ---------------------------- #
+
+    def handle_get(self, msg):
+      # If this replica is not the leader, redirect the client to the leader
+      if self.leader != self.id:
+          redirect_msg = {
+              "src": self.id,
+              "dst": msg["src"],
+              "leader": self.leader,
+              "type": "redirect",
+              "MID": msg["MID"]
+          }
+          self.send(redirect_msg)
+          return
+
+      # If the key does not exist in the store, return an empty value
+      if msg["key"] not in self.store:
+          response = {
+              "src": self.id,
+              "dst": msg["src"],
+              "leader": self.leader,
+              "type": "ok",
+              "MID": msg["MID"],
+              "value": ""
+          }
+          self.send(response)
+          return
+
+      # Otherwise, return the value of the key
+      value = self.store[msg["key"]]
+      response = {
+          "src": self.id,
+          "dst": msg["src"],
+          "leader": self.leader,
+          "type": "ok",
+          "MID": msg["MID"],
+          "value": value
+      }
+      self.send(response)
+
+    def handle_put(self, msg):
+        # If this replica is not the leader, redirect the client to the leader
+        if self.leader != self.id:
+            redirect_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": self.leader,
+                "type": "redirect",
+                "MID": msg["MID"]
+            }
+            self.send(redirect_msg)
+            return
+
+        # Update the store with the key-value pair from the message
+        self.store[msg["key"]] = msg["value"]
+
+        # Return an ok message to the client
+        response = {
+            "src": self.id,
+            "dst": msg["src"],
+            "leader": self.leader,
+            "type": "ok",
+            "MID": msg["MID"]
+        }
+        self.send(response)
+
+
+        
+
+
+
+
+    # ------------------------------ Main Functions ------------------------------ #
+
+    def handle_message(self, message):
+      if message["type"] == "get":
+        #print("Received get request for key %s" % message["key"])
+        self.handle_get(message)
+      elif message["type"] == "put":
+       # print("Received put request for key %s" % message["key"])
+        self.handle_put(message)
+      elif message["type"] == "election":
+        self.handle_election(message)
+      elif message["type"] == "vote":
+        self.handle_vote(message)
+      elif message["type"] == "heartbeat":
+        self.handle_heartbeat(message)
+
+    def run(self):
+      while True:
+        data, addr = self.socket.recvfrom(65535)
+        msg = data.decode('utf-8')
+
+        print("Received message '%s'" % (msg,), flush=True)
+        self.handle_message(json.loads(msg))
+
+        current = time.time()
+        if self.state == "follower" and current - self.last_heartbeat > self.election_timeout:
+            self.start_election()
+
+            self.last = current
+
+        if self.state == "leader" and current - self.last > self.election_timeout:
+            heartbeat = { "src": self.id, "dst": BROADCAST, "leader": self.id, "type": "heartbeat", "term": self.term }
+            self.send(heartbeat)
+            self.last = current
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
+ """
+
